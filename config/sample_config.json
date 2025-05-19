@@ -34,10 +34,10 @@
         "enabled": true,
         "smtp_host": "smtp.gmail.com",
         "smtp_port": 587,
-        "smtp_username": "jsodam@gmail.com",
-        "smtp_password": "hmgw qizs cwxm kcda",
-        "from_address": "jsodam@gmail.com",
-        "to_addresses": ["jsodam@gmail.com"],
+        "smtp_username": "",
+        "smtp_password": "",
+        "from_address": "",
+        "to_addresses": [""],
         "use_tls": true
     },
     
