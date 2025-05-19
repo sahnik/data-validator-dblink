@@ -1,0 +1,52 @@
+{
+    "source_db": {
+        "username": "source_user",
+        "password": "source_password",
+        "host": "source-db-host",
+        "port": 1521,
+        "service_name": "source_service"
+    },
+    "target_db": {
+        "username": "target_user",
+        "password": "target_password",
+        "host": "target-db-host",
+        "port": 1521,
+        "service_name": "target_service"
+    },
+    "db_link_name": "TARGET_DB_LINK",
+    
+    "table_mappings": [
+        {
+            "source_table": "SAMPLE_DATA",
+            "target_table": "SAMPLE_DATA",
+            "natural_keys": ["VARCHAR_COL1", "NUMBER_COL1", "DATE_COL1"],
+            "exclude_columns": ["CREATED_DATE", "UPDATED_DATE", "CREATED_BY", "UPDATED_BY","ID"],
+            "chunk_size": 10000
+        }
+    ],
+    
+    "max_concurrent_validations": 5,
+    "progress_tracking_enabled": true,
+    "progress_table_name": "DATA_VALIDATION_PROGRESS",
+    "results_table_name": "DATA_VALIDATION_RESULTS",
+    
+    "email_config": {
+        "enabled": true,
+        "smtp_host": "smtp.gmail.com",
+        "smtp_port": 587,
+        "smtp_username": "jsodam@gmail.com",
+        "smtp_password": "hmgw qizs cwxm kcda",
+        "from_address": "jsodam@gmail.com",
+        "to_addresses": ["jsodam@gmail.com"],
+        "use_tls": true
+    },
+    
+    "run_window": {
+        "start_time": "22:00:00",
+        "end_time": "06:00:00",
+        "days_of_week": [0, 1, 2, 3, 4]
+    },
+    
+    "incremental_mode": false,
+    "incremental_column": "LAST_MODIFIED_DATE"
+}
