@@ -627,8 +627,68 @@ class TableValidator:
                 logger.debug(f"Variable values - matched: {matched_val}, mismatched: {mismatched_val}, " +
                            f"missing: {missing_val}, processed: {processed_val}, last_key: {last_key_val}")
                 
-                # In our simplified version, we're not returning mismatch details
+                # Get mismatch details using a separate query instead of PL/SQL arrays
+                # This avoids the ORA-06513 error completely
                 mismatch_details = []
+                
+                # Only get details if there are mismatches and we're configured to store them
+                if (mismatched_val > 0 or missing_val > 0) and hasattr(self, 'config') and self.config and self.config.store_mismatch_details:
+                    # Get a few sample mismatched and missing rows for detail
+                    max_details_to_get = min(20, self.config.max_mismatch_details)  # Limit to reasonable number
+                    try:
+                        # Extract table and key information from the PL/SQL block
+                        source_table = self._extract_table_from_plsql(plsql_block, "source_table")
+                        target_table = self._extract_table_from_plsql(plsql_block, "target_table")
+                        natural_keys = self._extract_natural_keys_from_plsql(plsql_block)
+                        
+                        # Check if we have enough information to proceed
+                        if (source_table.startswith("UNKNOWN") or 
+                            target_table.startswith("UNKNOWN") or 
+                            not natural_keys):
+                            # If we couldn't extract the necessary information, create a generic mismatch detail
+                            logger.warning("Could not extract table information from PL/SQL block")
+                            if mismatched_val > 0:
+                                mismatch_details.append({
+                                    "key_values": "{}",
+                                    "mismatch_type": "COLUMN_MISMATCH",
+                                    "column_name": "UNKNOWN",
+                                    "source_value": f"Mismatched rows: {mismatched_val}",
+                                    "target_value": "Could not extract detailed information"
+                                })
+                            if missing_val > 0:
+                                mismatch_details.append({
+                                    "key_values": "{}",
+                                    "mismatch_type": "MISSING_IN_TARGET",
+                                    "column_name": None,
+                                    "source_value": f"Missing rows: {missing_val}",
+                                    "target_value": None
+                                })
+                        else:
+                            # Collect column mismatch details with direct SQL
+                            if mismatched_val > 0:
+                                mismatch_details.extend(
+                                    self._get_column_mismatch_details(
+                                        mapping_source_table=source_table,
+                                        mapping_target_table=target_table,
+                                        natural_keys=natural_keys,
+                                        limit=max_details_to_get // 2  # Split the limit between different types
+                                    )
+                                )
+                            
+                            # Collect missing row details
+                            if missing_val > 0:
+                                mismatch_details.extend(
+                                    self._get_missing_row_details(
+                                        mapping_source_table=source_table,
+                                        mapping_target_table=target_table,
+                                        natural_keys=natural_keys,
+                                        limit=max_details_to_get // 2
+                                    )
+                                )
+                    except Exception as e:
+                        # If detail collection fails, log but continue
+                        logger.warning(f"Error collecting column mismatch details: {e}")
+                        logger.info("Continuing validation without column mismatch details")
                 
                 logger.debug("Returning results from chunk validation")
                 return {
@@ -639,6 +699,329 @@ class TableValidator:
                     "last_key": last_key_val,
                     "mismatch_details": mismatch_details
                 }
+    
+    def _extract_table_from_plsql(self, plsql_block: str, table_var_name: str) -> str:
+        """Extract a table name from the PL/SQL block."""
+        import re
+        
+        # Try to find table names in the FROM clause which is the most reliable
+        if table_var_name == "source_table":
+            # Look for pattern like: JOIN table_name@db_link
+            pattern = r"JOIN\s+(\w+)@"
+            match = re.search(pattern, plsql_block)
+            if match:
+                return match.group(1)
+                
+            # Alternative pattern: FROM table_name@db_link
+            pattern = r"FROM\s+(\w+)@"
+            match = re.search(pattern, plsql_block)
+            if match:
+                return match.group(1)
+        elif table_var_name == "target_table":
+            # Look for pattern like: FROM table_name t
+            pattern = r"FROM\s+(\w+)\s+t"
+            match = re.search(pattern, plsql_block)
+            if match:
+                return match.group(1)
+                
+        # If we get here, try more generic approach
+        # Look for variable definitions
+        pattern = rf"{table_var_name}\s*=\s*([^\s,;]+)"
+        match = re.search(pattern, plsql_block)
+        if match:
+            return match.group(1)
+            
+        # If all else fails, try to find any reference with the table alias
+        if table_var_name == "target_table":
+            # Find any reference to t.something
+            pattern = r"t\.(\w+)"
+            match = re.search(pattern, plsql_block)
+            if match:
+                # We found a column name, now try to find which table it belongs to
+                return "UNKNOWN_TARGET_TABLE"
+        
+        return "UNKNOWN_TABLE"
+        
+    def _extract_natural_keys_from_plsql(self, plsql_block: str) -> List[str]:
+        """Extract natural keys from the PL/SQL block."""
+        # Search for key conditions in the ON clause 
+        import re
+        keys = []
+        # Look for patterns like "t.KEY = s.KEY"
+        key_pattern = r"t\.(\w+)\s*=\s*s\.\1"
+        matches = re.findall(key_pattern, plsql_block)
+        if matches:
+            return matches
+        return []
+        
+    def _parse_key_json(self, key_json: str) -> dict:
+        """Parse a JSON-like string of key values."""
+        if not key_json or not key_json.startswith('{') or not key_json.endswith('}'):
+            return {}
+            
+        try:
+            # For proper JSON strings
+            import json
+            return json.loads(key_json)
+        except json.JSONDecodeError:
+            # For semi-JSON strings we generate (they might not be proper JSON)
+            try:
+                # Remove the braces
+                key_str = key_json[1:-1]
+                # Split by commas
+                pairs = key_str.split(',')
+                
+                result = {}
+                for pair in pairs:
+                    if ':' not in pair:
+                        continue
+                        
+                    key, value = pair.split(':', 1)
+                    
+                    # Clean up the key and value
+                    key = key.strip().strip('"\'')
+                    value = value.strip().strip('"\'')
+                    
+                    # Try to convert numeric values
+                    try:
+                        if '.' in value:
+                            value = float(value)
+                        else:
+                            value = int(value)
+                    except ValueError:
+                        # Keep as string if not numeric
+                        pass
+                        
+                    result[key] = value
+                
+                return result
+            except Exception as e:
+                logger.warning(f"Error parsing key JSON: {e}")
+                return {}
+    
+    def _get_column_mismatch_details(self, mapping_source_table: str, mapping_target_table: str, 
+                                   natural_keys: List[str], limit: int = 20) -> List[Dict]:
+        """Get column mismatch details using direct SQL rather than PL/SQL arrays."""
+        logger.debug(f"Getting column mismatch details for {mapping_target_table} vs {mapping_source_table}")
+        
+        if not natural_keys:
+            logger.warning("No natural keys found for mismatch details query")
+            return []
+            
+        # Get all non-key columns
+        all_columns = self._get_table_columns(mapping_source_table)
+        non_key_columns = [col for col in all_columns if col not in natural_keys]
+        
+        if not non_key_columns:
+            # If all columns are part of the natural key, we won't find mismatches
+            # Just return an empty list since there are no columns to compare
+            logger.warning("No non-key columns found for mismatch details query")
+            return []
+            
+        # Ensure we have at least one column to compare - safety check
+        if not all_columns:
+            logger.warning("No columns found for the table")
+            return []
+            
+        # Build JSON format for key values
+        key_json_expr = "'{' || " + " || ',' || ".join([f"'\"" + key + "\":\"' || t." + key + " || '\"'" for key in natural_keys]) + " || '}'"
+        
+        # Build comparison conditions for all columns 
+        # We'll use a CASE expression to identify which column is mismatched
+        comparison_conditions = []
+        for col in non_key_columns:
+            comparison_conditions.append(
+                f"""WHEN ((t.{col} IS NULL AND s.{col} IS NOT NULL) OR 
+                       (t.{col} IS NOT NULL AND s.{col} IS NULL) OR 
+                       (t.{col} IS NOT NULL AND s.{col} IS NOT NULL AND t.{col} != s.{col}))
+                    THEN '{col}'"""
+            )
+        
+        column_case = "NULL" if not comparison_conditions else f"""
+        CASE
+            {' '.join(comparison_conditions)}
+            ELSE NULL
+        END as column_name
+        """
+        
+        # Build all the conditions outside of f-strings to avoid nesting
+        join_condition = " AND ".join([f"t.{key} = s.{key}" for key in natural_keys])
+        
+        # Build comparison conditions for WHERE clause
+        where_conditions = []
+        for col in non_key_columns:
+            where_conditions.append(f"""(
+                (t.{col} IS NULL AND s.{col} IS NOT NULL) OR 
+                (t.{col} IS NOT NULL AND s.{col} IS NULL) OR 
+                (t.{col} IS NOT NULL AND s.{col} IS NOT NULL AND t.{col} != s.{col})
+            )""")
+            
+        # Handle the case where we have no conditions (should never happen)
+        if not where_conditions:
+            where_clause = "1=0"  # No conditions, no mismatches possible
+        else:
+            where_clause = " OR ".join(where_conditions)
+        
+        # Instead of trying to get the values in the SQL query, let's just get the column names
+        # and then execute specific queries for each mismatched row to get the exact column values
+        query = f"""
+        SELECT DISTINCT
+            {key_json_expr} as key_values,
+            CASE 
+                {' '.join(comparison_conditions)}
+                ELSE NULL
+            END as column_name,
+            'COLUMN_MISMATCH' as mismatch_type
+        FROM {mapping_target_table} t
+        JOIN {mapping_source_table}@{self.db_link_name} s
+        ON {join_condition}
+        WHERE ({where_clause})
+        AND ROWNUM <= {limit}
+        """
+        
+        try:
+            # Execute the query to get mismatch details
+            logger.debug(f"Executing mismatch details query: {query[:500]}...")
+            results = self.target_db.execute_query(query)
+            
+            # Process the initial results
+            details = []
+            
+            # Parse the key values and get the column-specific values for each mismatch
+            for row in results:
+                if not row['COLUMN_NAME']:
+                    continue  # Skip if no column name identified
+                    
+                column_name = row['COLUMN_NAME']
+                key_values = row['KEY_VALUES']
+                
+                # Extract natural key values from the JSON-like string
+                key_dict = self._parse_key_json(key_values)
+                if not key_dict:
+                    continue  # Skip if we can't parse the key values
+                    
+                # Get the actual source and target values for the specific mismatched column
+                try:
+                    # Build conditions for the WHERE clause to find this specific row
+                    key_conditions = []
+                    for key, value in key_dict.items():
+                        # Properly quote string values
+                        if isinstance(value, str):
+                            key_conditions.append(f"t.{key} = '{value}'")
+                        else:
+                            key_conditions.append(f"t.{key} = {value}")
+                            
+                    # Execute a query to get the specific column values
+                    value_query = f"""
+                    SELECT 
+                        TO_CHAR(t.{column_name}) as target_value,
+                        TO_CHAR(s.{column_name}) as source_value
+                    FROM {mapping_target_table} t
+                    JOIN {mapping_source_table}@{self.db_link_name} s
+                    ON {join_condition}
+                    WHERE {" AND ".join(key_conditions)}
+                    """
+                    
+                    # Execute the query to get the column values
+                    value_results = self.target_db.execute_query(value_query)
+                    
+                    # Add the detail with the correct column values
+                    if value_results:
+                        source_value = value_results[0]['SOURCE_VALUE']
+                        target_value = value_results[0]['TARGET_VALUE']
+                        
+                        detail = {
+                            "key_values": key_values,
+                            "mismatch_type": row['MISMATCH_TYPE'],
+                            "column_name": column_name,
+                            "source_value": source_value,
+                            "target_value": target_value
+                        }
+                        details.append(detail)
+                    else:
+                        # If we can't get the values, add a detail with generic values
+                        detail = {
+                            "key_values": key_values,
+                            "mismatch_type": row['MISMATCH_TYPE'],
+                            "column_name": column_name,
+                            "source_value": "Could not retrieve value",
+                            "target_value": "Could not retrieve value"
+                        }
+                        details.append(detail)
+                except Exception as e:
+                    # If any error occurs, log and continue with the next mismatch
+                    logger.warning(f"Error getting column values for {column_name}: {e}")
+                    # Add a detail with the error
+                    detail = {
+                        "key_values": key_values,
+                        "mismatch_type": row['MISMATCH_TYPE'],
+                        "column_name": column_name,
+                        "source_value": f"Error: {str(e)[:50]}",
+                        "target_value": f"Error: {str(e)[:50]}"
+                    }
+                    details.append(detail)
+                    
+            logger.debug(f"Found {len(details)} column mismatch details")
+            return details
+            
+        except Exception as e:
+            logger.error(f"Error executing column mismatch details query: {e}")
+            return []
+    
+    def _get_missing_row_details(self, mapping_source_table: str, mapping_target_table: str,
+                               natural_keys: List[str], limit: int = 10) -> List[Dict]:
+        """Get details of rows that exist in source but are missing from target."""
+        logger.debug(f"Getting missing row details for {mapping_source_table} rows missing from {mapping_target_table}")
+        
+        if not natural_keys:
+            logger.warning("No natural keys found for missing row details query")
+            return []
+        
+        # Build a JSON string representation of the natural keys
+        key_json_expr = "'{' || " + " || ',' || ".join([f"'\"" + key + "\":\"' || s." + key + " || '\"'" for key in natural_keys]) + " || '}'"
+        
+        # Build the join condition for natural keys
+        join_condition = " AND ".join([f"t.{key} = s.{key}" for key in natural_keys])
+        
+        # Simple query to find rows in source that don't exist in target
+        query = f"""
+        SELECT 
+            {key_json_expr} as key_values,
+            'MISSING_IN_TARGET' as mismatch_type,
+            NULL as column_name,
+            NULL as target_value,
+            NULL as source_value
+        FROM {mapping_source_table}@{self.db_link_name} s
+        WHERE NOT EXISTS (
+            SELECT 1 FROM {mapping_target_table} t
+            WHERE {join_condition}
+        )
+        AND ROWNUM <= {limit}
+        """
+        
+        try:
+            # Execute the query
+            logger.debug(f"Executing missing row details query: {query[:500]}...")
+            results = self.target_db.execute_query(query)
+            
+            # Format the results
+            details = []
+            for row in results:
+                detail = {
+                    "key_values": row['KEY_VALUES'],
+                    "mismatch_type": row['MISMATCH_TYPE'],
+                    "column_name": None,
+                    "source_value": None,
+                    "target_value": None
+                }
+                details.append(detail)
+                
+            logger.debug(f"Found {len(details)} missing row details")
+            return details
+            
+        except Exception as e:
+            logger.error(f"Error executing missing row details query: {e}")
+            return []
     
     def _count_extra_in_target(self, source_table: str, target_table: str,
                               natural_keys: List[str],
