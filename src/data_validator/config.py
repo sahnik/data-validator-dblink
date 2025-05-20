@@ -58,6 +58,9 @@ class ValidationConfig(BaseModel):
     progress_tracking_enabled: bool = True
     progress_table_name: str = "DATA_VALIDATION_PROGRESS"
     results_table_name: str = "DATA_VALIDATION_RESULTS"
+    mismatch_details_table_name: str = "DATA_VALIDATION_MISMATCH_DETAILS"
+    store_mismatch_details: bool = True
+    max_mismatch_details: int = 1000  # Maximum number of mismatches to store per table
     
     run_window: Optional[RunWindow] = None
     
@@ -78,6 +81,18 @@ class ValidationProgress(BaseModel):
     error_message: Optional[str]
 
 
+class MismatchDetail(BaseModel):
+    id: int = 0
+    validation_id: int
+    table_name: str
+    mismatch_type: str  # 'COLUMN_MISMATCH', 'MISSING_IN_TARGET', 'EXTRA_IN_TARGET'
+    key_values: str  # JSON string of natural key values
+    column_name: Optional[str] = None
+    source_value: Optional[str] = None
+    target_value: Optional[str] = None
+    capture_time: Optional[datetime] = None
+
+
 class ValidationResult(BaseModel):
     id: int
     table_name: str
@@ -91,3 +106,4 @@ class ValidationResult(BaseModel):
     completed_at: datetime
     status: str  # 'SUCCESS', 'FAILED', 'PARTIAL'
     error_message: Optional[str]
+    mismatch_details: List[MismatchDetail] = Field(default_factory=list)

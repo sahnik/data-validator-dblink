@@ -25,7 +25,8 @@ class ValidationOrchestrator:
         self.repository = ValidationRepository(
             self.target_db,
             config.progress_table_name,
-            config.results_table_name
+            config.results_table_name,
+            config.mismatch_details_table_name
         )
         
         # Initialize utilities
@@ -35,7 +36,8 @@ class ValidationOrchestrator:
         self.table_validator = TableValidator(
             self.target_db,
             config.db_link_name,
-            self.repository
+            self.repository,
+            config
         )
     
     def initialize(self):

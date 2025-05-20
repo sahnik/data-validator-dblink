@@ -42,6 +42,9 @@
     "progress_tracking_enabled": true,
     "progress_table_name": "DATA_VALIDATION_PROGRESS",
     "results_table_name": "DATA_VALIDATION_RESULTS",
+    "mismatch_details_table_name": "DATA_VALIDATION_MISMATCH_DETAILS",
+    "store_mismatch_details": true,
+    "max_mismatch_details": 1000,
     
     "run_window": {
         "start_time": "22:00:00",

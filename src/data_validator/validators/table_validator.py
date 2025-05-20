@@ -1,9 +1,10 @@
 import logging
 import time
+import json
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
-from ..config import TableMapping, ValidationResult
+from ..config import TableMapping, ValidationResult, MismatchDetail
 from ..db.connection import OracleConnectionManager
 from ..db.repository import ValidationRepository
 
@@ -11,10 +12,11 @@ logger = logging.getLogger(__name__)
 
 
 class TableValidator:
-    def __init__(self, target_db: OracleConnectionManager, db_link_name: str, repository: ValidationRepository):
+    def __init__(self, target_db: OracleConnectionManager, db_link_name: str, repository: ValidationRepository, config=None):
         self.target_db = target_db
         self.db_link_name = db_link_name
         self.repository = repository
+        self.config = config  # Store the config for access to mismatch details settings
         # The DB link is created on the target database pointing to the source
     
     def validate_table(self, mapping: TableMapping) -> ValidationResult:
@@ -48,7 +50,22 @@ class TableValidator:
             end_time = datetime.now()
             duration = (end_time - start_time).total_seconds()
             
-            # Save and return result
+            # Process any mismatch details
+            mismatch_details = []
+            if 'mismatch_details' in result and self.config and self.config.store_mismatch_details:
+                # Convert raw mismatch details to MismatchDetail objects
+                for detail in result['mismatch_details']:
+                    mismatch_details.append(MismatchDetail(
+                        validation_id=0,  # Will be set when saving
+                        table_name=mapping.source_table,
+                        mismatch_type=detail['mismatch_type'],
+                        key_values=detail['key_values'],
+                        column_name=detail['column_name'],
+                        source_value=detail['source_value'],
+                        target_value=detail['target_value']
+                    ))
+            
+            # First save the validation result to get an ID
             validation_result = ValidationResult(
                 id=0,  # Will be set by repository
                 table_name=mapping.source_table,
@@ -61,10 +78,23 @@ class TableValidator:
                 started_at=start_time,
                 completed_at=end_time,
                 status="SUCCESS" if result['mismatched'] == 0 else "PARTIAL",
-                error_message=None
+                error_message=None,
+                mismatch_details=[]  # Don't pass mismatch_details here, we'll handle them separately
             )
             
-            self.repository.save_result(validation_result)
+            # Save the result and get the assigned ID
+            validation_id = self.repository.save_result(validation_result)
+            validation_result.id = validation_id
+            
+            # Now save the mismatch details with the correct validation_id
+            if mismatch_details and hasattr(self, 'config') and self.config.store_mismatch_details:
+                logger.info(f"Saving {len(mismatch_details)} mismatch details for validation {validation_id}")
+                # Update each mismatch detail with the correct validation_id
+                for detail in mismatch_details:
+                    detail.validation_id = validation_id
+                # Save the details
+                self.repository.save_mismatch_details(validation_id, mismatch_details)
+            
             return validation_result
             
         except Exception as e:
@@ -112,13 +142,14 @@ class TableValidator:
         return result[0]['CNT']
     
     def _validate_in_chunks(self, mapping: TableMapping, progress_id: int, 
-                           total_rows: int) -> Dict[str, int]:
+                           total_rows: int) -> Dict[str, any]:
         """Validate table data in chunks."""
         results = {
             'matched': 0,
             'mismatched': 0,
             'missing_in_target': 0,
-            'extra_in_target': 0
+            'extra_in_target': 0,
+            'mismatch_details': []
         }
         
         # Get column info
@@ -161,6 +192,19 @@ class TableValidator:
             results['mismatched'] += chunk_result['mismatched']
             results['missing_in_target'] += chunk_result['missing_in_target']
             
+            # Collect mismatch details if available and store_mismatch_details is enabled
+            if 'mismatch_details' in chunk_result and self.config and self.config.store_mismatch_details:
+                # Only collect up to the maximum allowed
+                remaining_capacity = self.config.max_mismatch_details - len(results['mismatch_details'])
+                if remaining_capacity > 0:
+                    details_to_add = chunk_result['mismatch_details'][:remaining_capacity]
+                    results['mismatch_details'].extend(details_to_add)
+                    
+                    # Log if we're reaching the limit
+                    if len(results['mismatch_details']) >= self.config.max_mismatch_details:
+                        logger.info(f"Reached maximum mismatch details limit ({self.config.max_mismatch_details})" +
+                                  f" for table {mapping.source_table}")
+            
             processed_rows += chunk_result['processed']
             last_key = chunk_result['last_key']
             
@@ -171,13 +215,28 @@ class TableValidator:
                 break
         
         # Check for extra rows in target
-        results['extra_in_target'] = self._count_extra_in_target(
+        extra_result = self._count_extra_in_target(
             mapping.source_table,
             mapping.target_table,
             mapping.natural_keys,
             mapping.incremental_mode,
             mapping.incremental_column
         )
+        
+        # If we received a tuple with count and details, unpack it
+        if isinstance(extra_result, tuple) and len(extra_result) == 2:
+            count, details = extra_result
+            results['extra_in_target'] = count
+            
+            # Add details if we have capacity and details collection is enabled
+            if self.config and self.config.store_mismatch_details:
+                remaining_capacity = self.config.max_mismatch_details - len(results['mismatch_details'])
+                if remaining_capacity > 0 and details:
+                    details_to_add = details[:remaining_capacity]
+                    results['mismatch_details'].extend(details_to_add)
+        else:
+            # Simple count was returned
+            results['extra_in_target'] = extra_result
         
         return results
     
@@ -235,6 +294,76 @@ class TableValidator:
         result = self.target_db.execute_query(query, {"table_name": table_name})
         return {row['COLUMN_NAME']: row['DATA_TYPE'] for row in result}
     
+    def _generate_column_checks(self, columns: List[str], natural_keys: List[str], 
+                              target_table: str, source_table: str, db_link_name: str) -> str:
+        """Generate PL/SQL code for checking which columns are mismatched."""
+        # This function creates a cursor to check each column for mismatches
+        # and returns a PL/SQL block that will execute this check
+        
+        cols_to_check = [col for col in columns if col not in natural_keys]
+        if not cols_to_check:
+            return "-- No columns to check\n"
+            
+        # Create a comma-separated list of columns for the query
+        col_list = ', '.join([f"'{col}'" for col in cols_to_check])
+        
+        # Build natural key conditions for the WHERE clause
+        # We need to join the records using natural keys
+        key_conditions_parts = []
+        for key in natural_keys:
+            key_conditions_parts.append(f"t.{key} = s.{key}")
+        key_conditions = " AND ".join(key_conditions_parts)
+        
+        # Build a WHERE clause for the natural key conditions against the current record
+        record_key_conditions_parts = []
+        for key in natural_keys:
+            record_key_conditions_parts.append(f"t.{key} = rec.{key}")
+        record_key_conditions = " AND ".join(record_key_conditions_parts)
+            
+        # Create a PL/SQL block that checks each column
+        # Instead of using ROWTYPE, we directly compare columns between tables
+        plsql = f"""
+        -- For each non-key column, check if it's mismatched
+        FOR check_col IN (
+            SELECT column_name 
+            FROM user_tab_columns 
+            WHERE table_name = UPPER('{target_table}')
+            AND column_name IN ({col_list})
+        ) LOOP
+            -- Check if this column has a mismatch between source and target
+            -- using dynamic SQL since we need to reference columns by name dynamically
+            DECLARE
+                v_is_mismatched NUMBER := 0;
+                v_sql VARCHAR2(4000);
+            BEGIN
+                -- Build dynamic SQL to check for mismatches
+                v_sql := 'SELECT COUNT(*) FROM ' || '{target_table}' || ' t, ' ||
+                         '{source_table}@' || '{db_link_name}' || ' s ' ||
+                         'WHERE ' || '{key_conditions}' || ' AND ' || '{record_key_conditions}' || ' AND ' ||
+                         '(t.' || check_col.column_name || ' != s.' || check_col.column_name || 
+                         ' OR (t.' || check_col.column_name || ' IS NULL AND s.' || check_col.column_name || ' IS NOT NULL)' ||
+                         ' OR (t.' || check_col.column_name || ' IS NOT NULL AND s.' || check_col.column_name || ' IS NULL))';
+                
+                -- Execute the dynamic SQL
+                EXECUTE IMMEDIATE v_sql INTO v_is_mismatched;
+                
+                -- If mismatched, add to our collection
+                IF v_is_mismatched > 0 THEN
+                    -- Add the column to our mismatched columns collection
+                    v_columns(v_detail_count) := check_col.column_name;
+                    EXIT; -- We only need one representative column for the detail
+                END IF;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    -- Log the error but continue with other columns
+                    v_columns(v_detail_count) := 'ERROR: ' || SQLERRM;
+                    EXIT;
+            END;
+        END LOOP;
+        """
+        
+        return plsql
+
     def _build_chunk_plsql(self, source_table: str, target_table: str,
                           columns: List[str], natural_keys: List[str],
                           key_conditions: str, where_clause: Optional[str],
@@ -242,7 +371,12 @@ class TableValidator:
                           last_key: Optional[str] = None, 
                           incremental_mode: bool = False,
                           incremental_column: Optional[str] = None) -> str:
-        """Build PL/SQL block for chunk-based comparison."""
+        """Build PL/SQL block for chunk-based comparison.
+        
+        Note: When using database links in Oracle, avoid using %ROWTYPE references
+        as they can cause type mismatch errors (DPY-2007). Instead, use direct column
+        references or dynamic SQL for column comparisons.
+        """
         
         # Build column comparison conditions - reversed s and t references
         column_comparisons = []
@@ -322,6 +456,49 @@ class TableValidator:
         
         last_key_concat = " || '~|~' || ".join(key_formatting)
         
+        # Add the column-specific mismatches for detailed reporting
+        column_mismatch_clauses = []
+        for col in columns:
+            if col not in natural_keys:
+                # Don't include comparison in the main SELECT to avoid cartesian product
+                column_mismatch_clauses.append(f"""
+                WHEN '{col}' THEN
+                    CASE 
+                        WHEN t.{col} IS NULL AND s.{col} IS NOT NULL THEN 'Target NULL, Source: ' || s.{col}
+                        WHEN t.{col} IS NOT NULL AND s.{col} IS NULL THEN 'Target: ' || t.{col} || ', Source NULL'
+                        WHEN t.{col} != s.{col} THEN 'Target: ' || t.{col} || ', Source: ' || s.{col}
+                        ELSE NULL
+                    END
+                """)
+        
+        column_mismatch_case = "NULL" if not column_mismatch_clauses else f"""
+        CASE c.col_name
+        {' '.join(column_mismatch_clauses)}
+        ELSE NULL
+        END
+        """
+        
+        # Aggregate the natural key values as a JSON-like string
+        key_json_elements = []
+        for key in natural_keys:
+            key_json_elements.append(f"'{key}:' || t.{key}")
+        
+        key_json = " || ',' || ".join(key_json_elements)
+        
+        # Generate column check code
+        column_checks = self._generate_column_checks(columns, natural_keys, target_table, source_table, self.db_link_name)
+        max_details = self.config.max_mismatch_details if hasattr(self, 'config') and self.config else 1000
+        
+        # Generate the join conditions for key checks
+        join_conditions = ' '.join([f"AND t.{key} = rec.{key}" for key in natural_keys])
+        
+        # Format the JSON key string differently to avoid f-string nesting issues
+        key_json_expr = " || ',' || ".join([f"'{key}:' || t.{key}" for key in natural_keys])
+        
+        # Log the plsql generation for debugging
+        logger.debug(f"Generating simplified PL/SQL for {target_table} validation with {source_table}@{self.db_link_name}")
+        
+        # Create PL/SQL that avoids using ROWTYPE with database links
         plsql = f"""
         DECLARE
             v_matched NUMBER := 0;
@@ -329,13 +506,20 @@ class TableValidator:
             v_missing NUMBER := 0;
             v_processed NUMBER := 0;
             v_last_key VARCHAR2(4000);
+            v_detail_count NUMBER := 0;
+            v_key_value VARCHAR2(4000);
             
+            -- Simple cursor that directly checks for mismatches between source and target
+            -- We need to specify column aliases to avoid duplicate column names
             CURSOR c_data IS
-                SELECT {key_values}, 
-                       CASE WHEN s.{natural_keys[0]} IS NULL THEN 'MISSING'
-                            WHEN {comparison_condition} THEN 'MISMATCH'
-                            ELSE 'MATCH'
-                       END as status
+                SELECT 
+                    {", ".join([f"t.{col} as t_{col}" for col in columns])},
+                    {", ".join([f"s.{col} as s_{col}" for col in columns])},
+                    CASE 
+                        WHEN s.{natural_keys[0]} IS NULL THEN 'MISSING'
+                        WHEN {comparison_condition} THEN 'MISMATCH'
+                        ELSE 'MATCH'
+                    END as status
                 FROM {target_table} t
                 LEFT JOIN {source_table}@{self.db_link_name} s
                     ON {key_conditions}
@@ -345,10 +529,16 @@ class TableValidator:
                 {pagination_condition}
                 ORDER BY {key_ordering}
                 FETCH FIRST {chunk_size} ROWS ONLY;
+                
         BEGIN
+            -- Process each row using direct SQL comparison
             FOR rec IN c_data LOOP
                 v_processed := v_processed + 1;
-                v_last_key := {last_key_concat};
+                
+                -- Construct the last key value for pagination
+                v_key_value := NULL;
+                {" || '~|~' || ".join([f"v_key_value := COALESCE(v_key_value || '~|~', '') || TO_CHAR(rec.t_{key})" for key in natural_keys])};
+                v_last_key := v_key_value;
                 
                 IF rec.status = 'MATCH' THEN
                     v_matched := v_matched + 1;
@@ -359,11 +549,13 @@ class TableValidator:
                 END IF;
             END LOOP;
             
+            -- Return results via OUT parameters
             :matched := v_matched;
             :mismatched := v_mismatched;
             :missing := v_missing;
             :processed := v_processed;
             :last_key := v_last_key;
+            :detail_count := v_detail_count;
         END;
         """
         
@@ -382,31 +574,79 @@ class TableValidator:
                 processed = cursor.var(int)
                 last_key_var = cursor.var(str)
                 
-                # Build parameters - no need for last_key_param as it's built into the query
+                # Variables for mismatch details - simplified for testing
+                # Just use a count variable, no arrays needed for simplified test
+                detail_count = cursor.var(int)
+                
+                # Build parameters - simplified for testing
                 params = {
                     "matched": matched,
                     "mismatched": mismatched,
                     "missing": missing,
                     "processed": processed,
-                    "last_key": last_key_var
+                    "last_key": last_key_var,
+                    "detail_count": detail_count
                 }
                 
-                # Execute PL/SQL block
-                cursor.execute(plsql_block, params)
+                # Log the first 500 characters of the PL/SQL block for debugging
+                logger.debug(f"Executing chunk validation with plsql_block preview: {plsql_block[:500]}...")
                 
+                try:
+                    # Execute simple test before the actual PL/SQL
+                    logger.debug("Executing simple test before main PL/SQL")
+                    cursor.execute("""
+                    BEGIN
+                       :out_var := 42;
+                    END;
+                    """, {"out_var": detail_count})
+                    test_result = detail_count.getvalue()
+                    logger.debug(f"Simple test result: {test_result}")
+                    
+                    # Now execute the actual PL/SQL block
+                    logger.debug("Executing main PL/SQL block")
+                    cursor.execute(plsql_block, params)
+                    logger.debug("PL/SQL execution completed successfully")
+                    
+                except Exception as e:
+                    # Log the error with specific details
+                    logger.error(f"Error executing PL/SQL: {str(e)}")
+                    # Log a larger portion of the PL/SQL if there's an error
+                    error_context = plsql_block[:min(len(plsql_block), 5000)]
+                    logger.error(f"PL/SQL causing error (fragment): {error_context}")
+                    raise
+                
+                # Log all variable values
+                logger.debug("Getting variable values from PL/SQL execution")
+                matched_val = matched.getvalue()
+                mismatched_val = mismatched.getvalue()
+                missing_val = missing.getvalue()
+                processed_val = processed.getvalue()
+                last_key_val = last_key_var.getvalue()
+                detail_count_val = detail_count.getvalue() or 0
+                
+                logger.debug(f"Variable values - matched: {matched_val}, mismatched: {mismatched_val}, " +
+                           f"missing: {missing_val}, processed: {processed_val}, last_key: {last_key_val}")
+                
+                # In our simplified version, we're not returning mismatch details
+                mismatch_details = []
+                
+                logger.debug("Returning results from chunk validation")
                 return {
-                    "matched": matched.getvalue(),
-                    "mismatched": mismatched.getvalue(),
-                    "missing_in_target": missing.getvalue(),
-                    "processed": processed.getvalue(),
-                    "last_key": last_key_var.getvalue()
+                    "matched": matched_val,
+                    "mismatched": mismatched_val,
+                    "missing_in_target": missing_val,
+                    "processed": processed_val,
+                    "last_key": last_key_val,
+                    "mismatch_details": mismatch_details
                 }
     
     def _count_extra_in_target(self, source_table: str, target_table: str,
                               natural_keys: List[str],
                               incremental_mode: bool = False,
-                              incremental_column: Optional[str] = None) -> int:
-        """Count rows that exist in target but not in source."""
+                              incremental_column: Optional[str] = None) -> Union[int, Tuple[int, List[Dict]]]:
+        """Count rows that exist in target but not in source and optionally return details."""
+        logger.debug(f"Counting extra rows in target table {target_table} not in source {source_table}")
+        
         # Since we're now querying from target, we need to change the approach
         # The "extra in target" are now rows in target that don't exist in source@dblink
         key_conditions = " AND ".join([f"t.{key} = s.{key}" for key in natural_keys])
@@ -414,7 +654,25 @@ class TableValidator:
         # Apply incremental filter if enabled
         incremental_condition = self._get_incremental_condition(source_table, incremental_mode, incremental_column, for_extra_target=True)
         
-        query = f"""
+        # If we don't need details, just return the count
+        if not (hasattr(self, 'config') and self.config.store_mismatch_details):
+            query = f"""
+            SELECT COUNT(*) as cnt
+            FROM {target_table} t
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {source_table}@{self.db_link_name} s
+                WHERE {key_conditions}
+            )
+            {incremental_condition}
+            """
+            
+            # Execute from target database
+            result = self.target_db.execute_query(query)
+            return result[0]['CNT']
+            
+        # We need both count and details
+        # First, get the count
+        count_query = f"""
         SELECT COUNT(*) as cnt
         FROM {target_table} t
         WHERE NOT EXISTS (
@@ -424,6 +682,42 @@ class TableValidator:
         {incremental_condition}
         """
         
-        # Execute from target database
-        result = self.target_db.execute_query(query)
-        return result[0]['CNT']
+        count_result = self.target_db.execute_query(count_query)
+        count = count_result[0]['CNT']
+        
+        # If there are no extra rows or we don't need to capture details, return just the count
+        if count == 0 or not self.config.store_mismatch_details:
+            return count
+        
+        # Now get the details up to the maximum limit
+        # Format the natural keys as a JSON-like string
+        # Create a JSON-like representation of keys
+        key_expr = " || ',' || ".join([f"'{key}:' || t.{key}" for key in natural_keys])
+        
+        detail_query = f"""
+        SELECT {", ".join([f"t.{key}" for key in natural_keys])},
+               '{{' || {key_expr} || '}}' as key_json
+        FROM {target_table} t
+        WHERE NOT EXISTS (
+            SELECT 1 FROM {source_table}@{self.db_link_name} s
+            WHERE {key_conditions}
+        )
+        {incremental_condition}
+        FETCH FIRST {self.config.max_mismatch_details} ROWS ONLY
+        """
+        
+        # Execute from target database to get details
+        detail_results = self.target_db.execute_query(detail_query)
+        
+        # Format the details
+        details = []
+        for row in detail_results:
+            details.append({
+                "key_values": row['KEY_JSON'],
+                "mismatch_type": "EXTRA_IN_TARGET",
+                "column_name": None,
+                "source_value": None,
+                "target_value": None
+            })
+        
+        return count, details

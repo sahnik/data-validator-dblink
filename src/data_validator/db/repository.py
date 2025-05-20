@@ -2,7 +2,7 @@ import logging
 from datetime import datetime
 from typing import List, Optional
 
-from ..config import ValidationProgress, ValidationResult, DatabaseConfig
+from ..config import ValidationProgress, ValidationResult, MismatchDetail, DatabaseConfig
 from .connection import OracleConnectionManager
 
 logger = logging.getLogger(__name__)
@@ -13,13 +13,15 @@ class ValidationRepository:
     
     All results and progress tracking are stored in the target database.
     """
-    def __init__(self, target_db_manager: OracleConnectionManager, progress_table: str, results_table: str):
+    def __init__(self, target_db_manager: OracleConnectionManager, progress_table: str, 
+                 results_table: str, mismatch_details_table: str = "DATA_VALIDATION_MISMATCH_DETAILS"):
         self.db_manager = target_db_manager
         self.progress_table = progress_table
         self.results_table = results_table
+        self.mismatch_details_table = mismatch_details_table
         
     def initialize_tables(self):
-        """Create progress and results tables if they don't exist."""
+        """Create progress, results, and mismatch details tables if they don't exist."""
         progress_ddl = f"""
         CREATE TABLE {self.progress_table} (
             id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -53,8 +55,30 @@ class ValidationRepository:
         )
         """
         
+        mismatch_details_ddl = f"""
+        CREATE TABLE {self.mismatch_details_table} (
+            id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            validation_id NUMBER NOT NULL,
+            table_name VARCHAR2(100) NOT NULL,
+            mismatch_type VARCHAR2(20) NOT NULL,
+            key_values CLOB,
+            column_name VARCHAR2(100),
+            source_value CLOB,
+            target_value CLOB,
+            capture_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT fk_mismatch_validation FOREIGN KEY (validation_id) 
+                REFERENCES {self.results_table}(id) ON DELETE CASCADE
+        )
+        """
+        
         # Check if tables exist
-        for table_name, ddl in [(self.progress_table, progress_ddl), (self.results_table, results_ddl)]:
+        tables_ddl = [
+            (self.progress_table, progress_ddl),
+            (self.results_table, results_ddl),
+            (self.mismatch_details_table, mismatch_details_ddl)
+        ]
+        
+        for table_name, ddl in tables_ddl:
             check_query = f"""
             SELECT COUNT(*) FROM user_tables WHERE table_name = UPPER(:table_name)
             """
@@ -186,8 +210,96 @@ class ValidationRepository:
                     "error_message": result.error_message,
                     "id": id_var
                 })
+                
+                # Get the ID from the returned value
+                validation_id = id_var.getvalue()[0]
+                
+                # Save mismatch details if available
+                if result.mismatch_details:
+                    self.save_mismatch_details(validation_id, result.mismatch_details)
+                
                 connection.commit()
-                return id_var.getvalue()[0]
+                return validation_id
+    
+    def save_mismatch_details(self, validation_id: int, details: List[MismatchDetail]):
+        """Save multiple mismatch details for a validation."""
+        if not details:
+            return
+        
+        # Log before attempting to insert
+        logger.debug(f"Preparing to save {len(details)} mismatch details for validation {validation_id}")
+        
+        try:
+            # Create the insert statement with APPEND hint to improve performance
+            insert_query = f"""
+            INSERT /*+ APPEND */ INTO {self.mismatch_details_table}
+            (validation_id, table_name, mismatch_type, key_values, column_name, 
+             source_value, target_value)
+            VALUES (:validation_id, :table_name, :mismatch_type, :key_values, 
+                    :column_name, :source_value, :target_value)
+            """
+            
+            # Process in smaller batches to reduce contention
+            BATCH_SIZE = 50
+            total_inserted = 0
+            
+            with self.db_manager.get_connection() as connection:
+                # Set a longer timeout for the connection
+                connection.callTimeout = 120000  # 2 minutes
+                
+                for i in range(0, len(details), BATCH_SIZE):
+                    batch = details[i:i+BATCH_SIZE]
+                    params_list = []
+                    
+                    for detail in batch:
+                        params_list.append({
+                            "validation_id": validation_id,
+                            "table_name": detail.table_name,
+                            "mismatch_type": detail.mismatch_type,
+                            "key_values": detail.key_values,
+                            "column_name": detail.column_name,
+                            "source_value": detail.source_value,
+                            "target_value": detail.target_value
+                        })
+                    
+                    # Execute the batch
+                    with self.db_manager.get_cursor(connection) as cursor:
+                        cursor.executemany(insert_query, params_list)
+                        connection.commit()
+                        total_inserted += len(batch)
+                        logger.debug(f"Saved batch of {len(batch)} mismatch details ({total_inserted}/{len(details)} total)")
+                
+            logger.info(f"Successfully saved all {total_inserted} mismatch details for validation {validation_id}")
+            
+        except Exception as e:
+            logger.error(f"Error saving mismatch details: {e}")
+            # Continue execution rather than failing the whole validation
+            # Just log the error and return
+            logger.warning("Continuing validation without mismatch details")
+                
+    def get_mismatch_details(self, validation_id: int) -> List[MismatchDetail]:
+        """Get mismatch details for a specific validation."""
+        query = f"""
+        SELECT * FROM {self.mismatch_details_table}
+        WHERE validation_id = :validation_id
+        ORDER BY id
+        """
+        
+        result = self.db_manager.execute_query(query, {"validation_id": validation_id})
+        return [
+            MismatchDetail(
+                id=row['ID'],
+                validation_id=row['VALIDATION_ID'],
+                table_name=row['TABLE_NAME'],
+                mismatch_type=row['MISMATCH_TYPE'],
+                key_values=row['KEY_VALUES'],
+                column_name=row['COLUMN_NAME'],
+                source_value=row['SOURCE_VALUE'],
+                target_value=row['TARGET_VALUE'],
+                capture_time=row['CAPTURE_TIME']
+            )
+            for row in result
+        ]
     
     def get_recent_results(self, limit: int = 10) -> List[ValidationResult]:
         """Get recent validation results."""
