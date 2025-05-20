@@ -1,11 +1,4 @@
 {
-    "source_db": {
-        "username": "source_user",
-        "password": "source_password",
-        "host": "source-db-host",
-        "port": 1521,
-        "service_name": "source_service"
-    },
     "target_db": {
         "username": "target_user",
         "password": "target_password",
@@ -13,7 +6,16 @@
         "port": 1521,
         "service_name": "target_service"
     },
-    "db_link_name": "TARGET_DB_LINK",
+    "db_link_name": "SOURCE_DB_LINK",
+    "db_link_notes": "This DB link must be created on the target database and point to the source database",
+    
+    "source_db": {
+        "username": "source_user",
+        "password": "source_password",
+        "host": "source-db-host",
+        "port": 1521,
+        "service_name": "source_service"
+    },
     
     "table_mappings": [
         {
@@ -21,7 +23,18 @@
             "target_table": "SAMPLE_DATA",
             "natural_keys": ["VARCHAR_COL1", "NUMBER_COL1", "DATE_COL1"],
             "exclude_columns": ["CREATED_DATE", "UPDATED_DATE", "CREATED_BY", "UPDATED_BY","ID"],
-            "chunk_size": 10000
+            "chunk_size": 10000,
+            "incremental_mode": false,
+            "incremental_column": null
+        },
+        {
+            "source_table": "CUSTOMERS",
+            "target_table": "CUSTOMERS",
+            "natural_keys": ["CUSTOMER_ID"],
+            "exclude_columns": ["CREATED_DATE", "UPDATED_BY", "LAST_LOGIN_IP"],
+            "chunk_size": 5000,
+            "incremental_mode": true,
+            "incremental_column": "LAST_MODIFIED_DATE"
         }
     ],
     
@@ -30,23 +43,9 @@
     "progress_table_name": "DATA_VALIDATION_PROGRESS",
     "results_table_name": "DATA_VALIDATION_RESULTS",
     
-    "email_config": {
-        "enabled": true,
-        "smtp_host": "smtp.gmail.com",
-        "smtp_port": 587,
-        "smtp_username": "",
-        "smtp_password": "",
-        "from_address": "",
-        "to_addresses": [""],
-        "use_tls": true
-    },
-    
     "run_window": {
         "start_time": "22:00:00",
         "end_time": "06:00:00",
         "days_of_week": [0, 1, 2, 3, 4]
-    },
-    
-    "incremental_mode": false,
-    "incremental_column": "LAST_MODIFIED_DATE"
+    }
 }

@@ -9,7 +9,6 @@ from .config import ValidationConfig, ValidationResult
 from .db.connection import OracleConnectionManager
 from .db.repository import ValidationRepository
 from .validators.table_validator import TableValidator
-from .utils.email_sender import EmailSender
 from .utils.window_checker import WindowChecker
 
 logger = logging.getLogger(__name__)
@@ -19,24 +18,21 @@ class ValidationOrchestrator:
     def __init__(self, config: ValidationConfig):
         self.config = config
         
-        # Initialize database connections
-        self.source_db = OracleConnectionManager(config.source_db)
+        # Initialize target database connection
         self.target_db = OracleConnectionManager(config.target_db)
         
-        # Initialize repository
+        # Initialize repository (using target_db for storing results)
         self.repository = ValidationRepository(
-            self.source_db,
+            self.target_db,
             config.progress_table_name,
             config.results_table_name
         )
         
         # Initialize utilities
-        self.email_sender = EmailSender(config.email_config)
         self.window_checker = WindowChecker(config.run_window)
         
         # Initialize validator
         self.table_validator = TableValidator(
-            self.source_db,
             self.target_db,
             config.db_link_name,
             self.repository
@@ -46,12 +42,17 @@ class ValidationOrchestrator:
         """Initialize the validation system."""
         logger.info("Initializing validation system...")
         
-        # Test database connections
-        if not self.source_db.test_connection():
-            raise Exception("Failed to connect to source database")
-        
+        # Test target database connection
         if not self.target_db.test_connection():
             raise Exception("Failed to connect to target database")
+        
+        # Test source database through the database link
+        try:
+            test_query = f"SELECT 1 FROM DUAL@{self.config.db_link_name}"
+            self.target_db.execute_query(test_query)
+            logger.info(f"Successfully connected to source database through DB link '{self.config.db_link_name}'")
+        except Exception as e:
+            raise Exception(f"Failed to connect to source database through DB link: {e}")
         
         # Initialize repository tables
         self.repository.initialize_tables()
@@ -74,9 +75,6 @@ class ValidationOrchestrator:
         # Run validations
         results = self._run_concurrent_validations()
         
-        # Send email report
-        if results and self.config.email_config.enabled:
-            self.email_sender.send_validation_report(results)
         
         logger.info(f"Validation process completed. Processed {len(results)} tables")
         return results

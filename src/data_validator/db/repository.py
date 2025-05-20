@@ -9,8 +9,12 @@ logger = logging.getLogger(__name__)
 
 
 class ValidationRepository:
-    def __init__(self, db_manager: OracleConnectionManager, progress_table: str, results_table: str):
-        self.db_manager = db_manager
+    """Repository for storing validation progress and results.
+    
+    All results and progress tracking are stored in the target database.
+    """
+    def __init__(self, target_db_manager: OracleConnectionManager, progress_table: str, results_table: str):
+        self.db_manager = target_db_manager
         self.progress_table = progress_table
         self.results_table = results_table
         

@@ -16,6 +16,13 @@ except Exception as e:
 
 
 class OracleConnectionManager:
+    """Manages connections to Oracle databases for validation.
+    
+    When using database links for validation:
+    - The DB link should be created on the target database
+    - The DB link should point to the source database
+    - Validation queries are executed from the target database
+    """
     def __init__(self, config: DatabaseConfig):
         self.config = config
         self._connection: Optional[oracledb.Connection] = None

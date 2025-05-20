@@ -28,29 +28,6 @@ class DatabaseConfig(BaseModel):
         return f"{self.username}/{self.password}@{self.host}:{self.port}/{self.service_name}"
 
 
-class EmailConfig(BaseModel):
-    enabled: bool = False
-    smtp_host: Optional[str] = None
-    smtp_port: int = 587
-    smtp_username: Optional[str] = None
-    smtp_password: Optional[str] = None
-    from_address: Optional[str] = None
-    to_addresses: List[str] = Field(default_factory=list)
-    use_tls: bool = True
-    
-    @validator('*', pre=True)
-    def expand_env_vars(cls, v):
-        """Expand environment variables in string values."""
-        if isinstance(v, str) and v.startswith('${') and v.endswith('}'):
-            env_var = v[2:-1]
-            return os.getenv(env_var, v)
-        # Handle lists of strings
-        if isinstance(v, list):
-            return [
-                os.getenv(item[2:-1], item) if isinstance(item, str) and item.startswith('${') and item.endswith('}') else item
-                for item in v
-            ]
-        return v
 
 
 class TableMapping(BaseModel):
@@ -60,6 +37,8 @@ class TableMapping(BaseModel):
     exclude_columns: List[str] = Field(default_factory=list)
     chunk_size: int = 10000
     where_clause: Optional[str] = None
+    incremental_mode: bool = False
+    incremental_column: Optional[str] = None  # e.g., "LAST_MODIFIED_DATE"
 
 
 class RunWindow(BaseModel):
@@ -69,9 +48,10 @@ class RunWindow(BaseModel):
 
 
 class ValidationConfig(BaseModel):
-    source_db: DatabaseConfig
     target_db: DatabaseConfig
     db_link_name: str
+    db_link_notes: Optional[str] = None
+    source_db: Optional[DatabaseConfig] = None  # Made optional as we use DB link instead
     table_mappings: List[TableMapping]
     
     max_concurrent_validations: int = 5
@@ -79,11 +59,7 @@ class ValidationConfig(BaseModel):
     progress_table_name: str = "DATA_VALIDATION_PROGRESS"
     results_table_name: str = "DATA_VALIDATION_RESULTS"
     
-    email_config: EmailConfig = Field(default_factory=EmailConfig)
     run_window: Optional[RunWindow] = None
-    
-    incremental_mode: bool = False
-    incremental_column: Optional[str] = None  # e.g., "LAST_MODIFIED_DATE"
     
     class Config:
         use_enum_values = True
