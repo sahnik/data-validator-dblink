@@ -2,10 +2,12 @@ import argparse
 import json
 import logging
 import sys
+import atexit
 from pathlib import Path
 
 from src.data_validator.config import ValidationConfig
 from src.data_validator.orchestrator import ValidationOrchestrator
+from src.data_validator.db.connection import OracleConnectionPool
 
 # Configure logging
 logging.basicConfig(
@@ -32,7 +34,20 @@ def load_config(config_file: Path) -> ValidationConfig:
         raise
 
 
+def cleanup_resources():
+    """Clean up resources on program exit."""
+    logger.info("Cleaning up database connection pools...")
+    try:
+        OracleConnectionPool.close_all_pools()
+        logger.info("All connection pools closed successfully")
+    except Exception as e:
+        logger.error(f"Error closing connection pools: {e}")
+
+
 def main():
+    # Register cleanup handler to ensure pools are closed on exit
+    atexit.register(cleanup_resources)
+    
     parser = argparse.ArgumentParser(description='Oracle Migration Data Validator')
     parser.add_argument(
         'config',
@@ -92,6 +107,9 @@ def main():
     except Exception as e:
         logger.error(f"Validation failed: {e}")
         sys.exit(1)
+    finally:
+        # Ensure connection pools are closed even if we exit due to an error
+        cleanup_resources()
 
 
 if __name__ == "__main__":

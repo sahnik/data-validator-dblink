@@ -4,7 +4,10 @@
         "password": "target_password",
         "host": "target-db-host",
         "port": 1521,
-        "service_name": "target_service"
+        "service_name": "target_service",
+        "pool_min": 2,
+        "pool_max": 10,
+        "pool_increment": 1
     },
     "db_link_name": "SOURCE_DB_LINK",
     "db_link_notes": "This DB link must be created on the target database and point to the source database",
@@ -14,7 +17,10 @@
         "password": "source_password",
         "host": "source-db-host",
         "port": 1521,
-        "service_name": "source_service"
+        "service_name": "source_service",
+        "pool_min": 2,
+        "pool_max": 10,
+        "pool_increment": 1
     },
     
     "table_mappings": [

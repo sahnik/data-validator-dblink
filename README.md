@@ -9,6 +9,7 @@ A configuration-driven data validation program for Oracle database migrations. T
 - **Chunk Processing**: Handles tables with billions of rows by processing in configurable chunks
 - **Progress Tracking**: Resumable validations with detailed progress tracking
 - **Concurrent Execution**: Configurable parallelism for faster validation
+- **Connection Pooling**: Efficient Oracle connection management for optimal performance
 - **Run Window Controls**: Schedule validations to run only during specified time windows (e.g., off-peak hours)
 - **Incremental Validation**: Ability to validate only rows changed since the last run
 - **Result Storage**: Detailed validation results stored in database tables
@@ -48,7 +49,10 @@ Create a JSON configuration file (see `config/sample_config.json` for example):
         "password": "target_password",
         "host": "target-db-host",
         "port": 1521,
-        "service_name": "target_service"
+        "service_name": "target_service",
+        "pool_min": 2,
+        "pool_max": 10,
+        "pool_increment": 1
     },
     "db_link_name": "SOURCE_DB_LINK",
     "db_link_notes": "This DB link must be created on the target database and point to the source database",
@@ -93,6 +97,32 @@ Then reference them in your config using `${VARIABLE_NAME}`:
 }
 ```
 
+### Connection Pooling Configuration
+
+The tool uses Oracle connection pooling to efficiently manage database connections. You can configure the following parameters in your database configuration:
+
+```json
+"target_db": {
+    "username": "target_user",
+    "password": "target_password",
+    "host": "target-db-host",
+    "port": 1521,
+    "service_name": "target_service",
+    "pool_min": 2,        // Minimum number of connections in the pool
+    "pool_max": 10,       // Maximum number of connections in the pool
+    "pool_increment": 1   // Number of connections to add when more are needed
+}
+```
+
+Connection pooling parameters:
+- `pool_min`: Minimum number of connections to maintain in the pool (default: 2)
+- `pool_max`: Maximum number of connections allowed in the pool (default: 10)
+- `pool_increment`: Number of connections to create at once when more are needed (default: 1)
+
+Choose these values based on your workload:
+- For small/medium validations: Use defaults (`pool_min=2`, `pool_max=10`)
+- For large validations with high concurrency: Consider increasing (`pool_min=5`, `pool_max=20`)
+
 ## Usage
 
 ### Run validation for all configured tables:
@@ -110,15 +140,25 @@ python main.py config/your_config.json --tables CUSTOMERS ORDERS
 python main.py config/your_config.json --resume
 ```
 
+### Test connection pooling:
+```bash
+python test_connection_pool.py
+```
+Note: Update the database credentials in test_connection_pool.py before running.
+
 ## How It Works
 
-1. **Connection Setup**: Establishes connections to both source and target databases
+1. **Connection Setup**: Establishes connection pools to both source and target databases
 2. **Table Initialization**: Creates progress and results tracking tables in the target database if needed
 3. **Chunk-Based Validation**: For each table:
    - Processes data in chunks using natural keys for ordering
    - Compares data using PL/SQL blocks executed on the target database using a database link to the source
    - Tracks progress for resumability
    - Records detailed results
+4. **Connection Management**: 
+   - Reuses database connections from the pools for optimal performance
+   - Automatically manages connection lifecycle and cleanup
+   - Scales connections based on concurrent validation workload
 
 ## Incremental Validation
 
@@ -191,7 +231,8 @@ Simply omit the `run_window` section from your configuration to allow validation
 - **Main Components**:
   - `ValidationOrchestrator`: Manages the overall validation process
   - `TableValidator`: Handles individual table validations
-  - `OracleConnectionManager`: Manages database connections
+  - `OracleConnectionManager`: Manages database connections and connection pools
+  - `OracleConnectionPool`: Handles connection pooling for efficient database access
   - `ValidationRepository`: Handles progress and result persistence
   - `WindowChecker`: Enforces run window constraints
 
@@ -200,4 +241,4 @@ Simply omit the `run_window` section from your configuration to allow validation
 The tool creates two database tables in the target database:
 - `DATA_VALIDATION_PROGRESS`: Tracks validation progress for resumability
 - `DATA_VALIDATION_RESULTS`: Stores final validation results
-
+- `DATA_VALIDATION_MISMATCH_DETAILS`: Stores detailed information about mismatched rows

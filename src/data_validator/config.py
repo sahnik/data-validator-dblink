@@ -14,6 +14,9 @@ class DatabaseConfig(BaseModel):
     host: str
     port: int = 1521
     service_name: str
+    pool_min: int = 2
+    pool_max: int = 10
+    pool_increment: int = 1
     
     @validator('*', pre=True)
     def expand_env_vars(cls, v):
